@@ -1,0 +1,416 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+      - name: Create project files
+        run: |
+          mkdir -p $(dirname settings.gradle)
+          cat > settings.gradle <<'EOF_0'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF_0
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'EOF_1'
+          org.gradle.jvmargs=-Xmx1G
+          minecraft_version=1.20.1
+          yarn_mappings=1.20.1+build.10
+          loader_version=0.15.11
+          fabric_version=0.92.2+1.20.1
+          mod_version=1.0.0
+          maven_group=com.example
+          archives_base_name=nickfx
+          EOF_1
+          mkdir -p $(dirname build.gradle)
+          cat > build.gradle <<'EOF_2'
+          plugins {
+              id 'fabric-loom' version '1.5-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+          base { archivesName = project.archives_base_name }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") { expand "version": project.version }
+          }
+
+          tasks.withType(JavaCompile).configureEach { it.options.release = 17 }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+          }
+          EOF_2
+          mkdir -p $(dirname src/main/resources/fabric.mod.json)
+          cat > src/main/resources/fabric.mod.json <<'EOF_3'
+          {
+            "schemaVersion": 1,
+            "id": "nickfx",
+            "version": "${version}",
+            "name": "NickFx",
+            "description": "Client-side local nickname and tag changer. Use /nickfx.",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.example.nickfx.NickFx"]
+            },
+            "mixins": [
+              { "config": "nickfx.mixins.json", "environment": "client" }
+            ],
+            "depends": {
+              "fabricloader": ">=0.15.0",
+              "minecraft": "~1.20.1",
+              "java": ">=17",
+              "fabric-api": "*"
+            }
+          }
+          EOF_3
+          mkdir -p $(dirname src/main/resources/nickfx.mixins.json)
+          cat > src/main/resources/nickfx.mixins.json <<'EOF_4'
+          {
+            "required": true,
+            "package": "com.example.nickfx.mixin",
+            "compatibilityLevel": "JAVA_17",
+            "client": ["ChatHudMixin", "PlayerListHudMixin"],
+            "injectors": { "defaultRequire": 1 }
+          }
+          EOF_4
+          mkdir -p $(dirname src/main/java/com/example/nickfx/NickFx.java)
+          cat > src/main/java/com/example/nickfx/NickFx.java <<'EOF_5'
+          package com.example.nickfx;
+
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.network.ClientPlayNetworkHandler;
+          import net.minecraft.client.network.PlayerListEntry;
+          import net.minecraft.command.CommandSource;
+          import net.minecraft.scoreboard.Team;
+          import net.minecraft.text.MutableText;
+          import net.minecraft.text.Style;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Formatting;
+
+          import java.io.IOException;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.Optional;
+          import java.util.Properties;
+
+          /**
+           * Sadece CLIENT tarafinda calisir. Degisiklikler yalnizca senin ekraninda gorunur
+           * (chat ve tab listesi). Sunucuya ve diger oyunculara hicbir sey gonderilmez.
+           */
+          public class NickFx implements ClientModInitializer {
+
+              private static Text nick = null;
+              private static Text tag = null;
+
+              private static final Path FILE =
+                  FabricLoader.getInstance().getConfigDir().resolve("nickfx.properties");
+
+              @Override
+              public void onInitializeClient() {
+                  load();
+
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, access) ->
+                      dispatcher.register(ClientCommandManager.literal("nickfx")
+                          .executes(ctx -> {
+                              say(ctx.getSource(), "Komutlar: /nickfx name <isim>, /nickfx tag <tag>, "
+                                  + "/nickfx copy <oyuncu>, /nickfx reset. Renk için &a, &c, &l, &#RRGGBB kullan.");
+                              return 1;
+                          })
+                          .then(ClientCommandManager.literal("name")
+                              .then(ClientCommandManager.argument("text", StringArgumentType.greedyString())
+                                  .executes(ctx -> {
+                                      nick = parse(StringArgumentType.getString(ctx, "text"));
+                                      save();
+                                      say(ctx.getSource(), "İsim ayarlandı (sadece senin ekranında).");
+                                      return 1;
+                                  })))
+                          .then(ClientCommandManager.literal("tag")
+                              .then(ClientCommandManager.argument("text", StringArgumentType.greedyString())
+                                  .executes(ctx -> {
+                                      setTag(parse(StringArgumentType.getString(ctx, "text")));
+                                      save();
+                                      say(ctx.getSource(), "Tag ayarlandı (sadece senin ekranında).");
+                                      return 1;
+                                  })))
+                          .then(ClientCommandManager.literal("copy")
+                              .then(ClientCommandManager.argument("player", StringArgumentType.word())
+                                  .suggests((ctx, b) -> CommandSource.suggestMatching(ctx.getSource().getPlayerNames(), b))
+                                  .executes(ctx -> {
+                                      String who = StringArgumentType.getString(ctx, "player");
+                                      Text copied = copyTagFrom(who);
+                                      if (copied == null) {
+                                          say(ctx.getSource(), "Oyuncu bulunamadı: " + who);
+                                          return 0;
+                                      }
+                                      if (copied.getString().isBlank()) {
+                                          say(ctx.getSource(), who + " adlı oyuncunun tag'ı yok.");
+                                          return 0;
+                                      }
+                                      setTag(copied);
+                                      save();
+                                      say(ctx.getSource(), who + " oyuncusunun tag'ı kopyalandı (sadece senin ekranında).");
+                                      return 1;
+                                  })))
+                          .then(ClientCommandManager.literal("reset")
+                              .executes(ctx -> {
+                                  nick = null;
+                                  tag = null;
+                                  save();
+                                  say(ctx.getSource(), "İsim ve tag sıfırlandı.");
+                                  return 1;
+                              })
+                              .then(ClientCommandManager.literal("name").executes(ctx -> {
+                                  nick = null;
+                                  save();
+                                  say(ctx.getSource(), "İsim sıfırlandı.");
+                                  return 1;
+                              }))
+                              .then(ClientCommandManager.literal("tag").executes(ctx -> {
+                                  tag = null;
+                                  save();
+                                  say(ctx.getSource(), "Tag sıfırlandı.");
+                                  return 1;
+                              })))
+                      ));
+              }
+
+              // ---------- Durum ----------
+
+              public static boolean active() {
+                  return nick != null || tag != null;
+              }
+
+              private static void setTag(Text t) {
+                  tag = (t == null || t.getString().isBlank()) ? null : t;
+              }
+
+              private static String realName() {
+                  return MinecraftClient.getInstance().getSession().getUsername();
+              }
+
+              /** Tag + isim birlesik gorunumu. */
+              public static Text displayText() {
+                  MutableText t = Text.empty();
+                  if (tag != null) {
+                      t.append(tag.copy());
+                      if (!tag.getString().endsWith(" ")) t.append(Text.literal(" "));
+                  }
+                  t.append(nick != null ? nick.copy() : Text.literal(realName()));
+                  return t;
+              }
+
+              /** Chat mesajlarindaki gercek ismini, secilen tag+isim ile degistirir (sadece gorsel). */
+              public static Text replaceInChat(Text in) {
+                  if (!active()) return in;
+                  String real = realName();
+                  if (real == null || real.isEmpty() || !in.getString().contains(real)) return in;
+
+                  Text disp = displayText();
+                  MutableText out = Text.empty();
+                  in.<Boolean>visit((style, str) -> {
+                      int i = 0;
+                      int idx;
+                      while ((idx = str.indexOf(real, i)) >= 0) {
+                          if (idx > i) out.append(Text.literal(str.substring(i, idx)).setStyle(style));
+                          out.append(disp.copy());
+                          i = idx + real.length();
+                      }
+                      if (i < str.length()) out.append(Text.literal(str.substring(i)).setStyle(style));
+                      return Optional.empty();
+                  }, Style.EMPTY);
+                  return out;
+              }
+
+              // ---------- Tag kopyalama ----------
+
+              private static Text copyTagFrom(String playerName) {
+                  ClientPlayNetworkHandler handler = MinecraftClient.getInstance().getNetworkHandler();
+                  if (handler == null) return null;
+                  for (PlayerListEntry e : handler.getPlayerList()) {
+                      String name = e.getProfile().getName();
+                      if (!name.equalsIgnoreCase(playerName)) continue;
+
+                      Team team = e.getScoreboardTeam();
+                      if (team != null) {
+                          Text prefix = team.getPrefix();
+                          if (!prefix.getString().isBlank()) return prefix.copy();
+                      }
+                      Text dn = e.getDisplayName();
+                      if (dn != null) {
+                          int cut = dn.getString().indexOf(name);
+                          if (cut > 0) return substringStyled(dn, cut);
+                      }
+                      return Text.empty();
+                  }
+                  return null;
+              }
+
+              private static Text substringStyled(Text text, int end) {
+                  MutableText out = Text.empty();
+                  int[] pos = {0};
+                  text.<Boolean>visit((style, str) -> {
+                      if (pos[0] >= end) return Optional.of(true);
+                      int take = Math.min(str.length(), end - pos[0]);
+                      out.append(Text.literal(str.substring(0, take)).setStyle(style));
+                      pos[0] += take;
+                      return Optional.empty();
+                  }, Style.EMPTY);
+                  return out;
+              }
+
+              // ---------- & renk kodlari ----------
+
+              private static MutableText parse(String s) {
+                  MutableText out = Text.empty();
+                  Style style = Style.EMPTY;
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i < s.length(); i++) {
+                      char c = s.charAt(i);
+                      if (c == '&' && i + 1 < s.length()) {
+                          char n = s.charAt(i + 1);
+                          if (n == '#' && i + 8 <= s.length()) {
+                              try {
+                                  int rgb = Integer.parseInt(s.substring(i + 2, i + 8), 16);
+                                  flush(out, sb, style);
+                                  style = Style.EMPTY.withColor(rgb);
+                                  i += 7;
+                                  continue;
+                              } catch (NumberFormatException ignored) { }
+                          }
+                          Formatting f = Formatting.byCode(n);
+                          if (f != null) {
+                              flush(out, sb, style);
+                              if (f == Formatting.RESET) style = Style.EMPTY;
+                              else if (f.isColor()) style = Style.EMPTY.withColor(f);
+                              else style = style.withFormatting(f);
+                              i++;
+                              continue;
+                          }
+                      }
+                      sb.append(c);
+                  }
+                  flush(out, sb, style);
+                  return out;
+              }
+
+              private static void flush(MutableText out, StringBuilder sb, Style style) {
+                  if (sb.length() > 0) {
+                      out.append(Text.literal(sb.toString()).setStyle(style));
+                      sb.setLength(0);
+                  }
+              }
+
+              // ---------- Kaydet / yukle ----------
+
+              private static void say(FabricClientCommandSource src, String msg) {
+                  src.sendFeedback(Text.literal(msg));
+              }
+
+              private static void save() {
+                  Properties p = new Properties();
+                  if (nick != null) p.setProperty("nick", Text.Serializer.toJson(nick));
+                  if (tag != null) p.setProperty("tag", Text.Serializer.toJson(tag));
+                  try (var w = Files.newBufferedWriter(FILE)) {
+                      p.store(w, "NickFx");
+                  } catch (IOException ignored) { }
+              }
+
+              private static void load() {
+                  if (!Files.exists(FILE)) return;
+                  Properties p = new Properties();
+                  try (var r = Files.newBufferedReader(FILE)) {
+                      p.load(r);
+                      String n = p.getProperty("nick");
+                      String t = p.getProperty("tag");
+                      if (n != null) nick = Text.Serializer.fromJson(n);
+                      if (t != null) setTag(Text.Serializer.fromJson(t));
+                  } catch (Exception ignored) { }
+              }
+          }
+          EOF_5
+          mkdir -p $(dirname src/main/java/com/example/nickfx/mixin/ChatHudMixin.java)
+          cat > src/main/java/com/example/nickfx/mixin/ChatHudMixin.java <<'EOF_6'
+          package com.example.nickfx.mixin;
+
+          import com.example.nickfx.NickFx;
+          import net.minecraft.client.gui.hud.ChatHud;
+          import net.minecraft.text.Text;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.ModifyVariable;
+
+          @Mixin(ChatHud.class)
+          public class ChatHudMixin {
+              @ModifyVariable(
+                  method = "addMessage(Lnet/minecraft/text/Text;Lnet/minecraft/network/message/MessageSignatureData;Lnet/minecraft/client/gui/hud/MessageIndicator;)V",
+                  at = @At("HEAD"),
+                  argsOnly = true
+              )
+              private Text nickfx$replaceName(Text message) {
+                  return NickFx.replaceInChat(message);
+              }
+          }
+          EOF_6
+          mkdir -p $(dirname src/main/java/com/example/nickfx/mixin/PlayerListHudMixin.java)
+          cat > src/main/java/com/example/nickfx/mixin/PlayerListHudMixin.java <<'EOF_7'
+          package com.example.nickfx.mixin;
+
+          import com.example.nickfx.NickFx;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.hud.PlayerListHud;
+          import net.minecraft.client.network.PlayerListEntry;
+          import net.minecraft.text.Text;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          @Mixin(PlayerListHud.class)
+          public class PlayerListHudMixin {
+              @Inject(method = "getPlayerName", at = @At("RETURN"), cancellable = true)
+              private void nickfx$tabName(PlayerListEntry entry, CallbackInfoReturnable<Text> cir) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  if (mc.player != null && NickFx.active()
+                          && entry.getProfile().getId().equals(mc.player.getUuid())) {
+                      cir.setReturnValue(NickFx.displayText());
+                  }
+              }
+          }
+          EOF_7
+      - name: Build
+        run: gradle build --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nickfx-jar
+          path: build/libs/*.jar
